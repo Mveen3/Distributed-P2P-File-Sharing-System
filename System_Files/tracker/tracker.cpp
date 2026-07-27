@@ -1,642 +1,735 @@
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <unordered_map>
-#include <set>
-#include <thread>
-#include <mutex>
-#include <algorithm>
-#include <sstream>
-#include <cstring>
-#include "../common/proto.h"
+// Tracker server.
+//
+// Holds the authoritative metadata for the network - users, groups, join
+// requests and the piece maps plus seeder lists of every shared file - and
+// replicates every change to the other tracker. Clients never exchange file
+// data with it; they only ask it who to talk to.
+//
+// Concurrency model: one thread per accepted connection, one process-wide mutex
+// around the state. Handlers take that mutex once, do their (purely in-memory)
+// work, queue any replication ops and release it. No network or disk I/O is ever
+// performed while another thread could be blocked on the state.
+
+#include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <unistd.h>
-#include <sys/stat.h>
 
-using namespace std;
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
-struct User { 
-    string pass; 
-    bool logged; 
-    User(const string &p="") : pass(p), logged(false) {} 
-};
+#include "../common/proto.h"
+#include "../common/sha1.h"
+#include "replica.h"
+#include "state.h"
 
-struct File { 
-    string group, filename, owner, sha; 
-    uint64_t size; 
-    vector<string> piece_sha; 
-    set<string> peers; 
-};
+namespace {
 
-static unordered_map<string, User> users;
-static unordered_map<string, pair<string, set<string>>> groups; 
-static unordered_map<string, vector<string>> requests;
-static unordered_map<string, File> files;
-static mutex mtx;
-static vector<string> trackers;
-static int self_idx;
-static string data_dir;
+using tracker::FileMeta;
+using tracker::Group;
+using tracker::State;
 
-bool member(const string& user, const string& group) {
-    auto it = groups.find(group);
-    return it != groups.end() && it->second.second.count(user);
+State g_state;
+std::mutex g_mutex;  // guards g_state
+tracker::Replicator g_replicator;
+std::string g_data_dir;
+std::vector<std::string> g_trackers;
+int g_self_index = 0;
+
+std::atomic<int> g_listen_fd{-1};
+std::atomic<bool> g_running{true};
+
+const int kBacklog = 64;
+
+// How often the accept loop wakes up on its own to recheck g_running. Bounds
+// worst-case shutdown latency without depending on cross-thread close()/shutdown()
+// actually waking a thread parked in accept() - a guarantee that does not hold in
+// every environment this may run under.
+const int kAcceptPollMs = 200;
+
+// Same idea for the console: it waits for stdin to become readable in bounded
+// slices instead of blocking indefinitely inside getline().
+const int kConsolePollMs = 200;
+
+// ---------------------------------------------------------------------------
+// Small parsing helpers. The protocol is text, and text from the network is
+// never trusted: every conversion below reports failure instead of throwing,
+// which is what a std::stoi() on a malformed field would do - taking the whole
+// tracker down with it.
+// ---------------------------------------------------------------------------
+
+bool parse_u64(const std::string &s, uint64_t &out) {
+    if (s.empty() || s.size() > 20) return false;
+    uint64_t v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + static_cast<uint64_t>(c - '0');
+    }
+    out = v;
+    return true;
 }
 
-bool owner(const string& user, const string& group) {
-    auto it = groups.find(group);
-    return it != groups.end() && it->second.first == user;
+// A client identifies its seeding endpoint either fully ("ip:port") or by port
+// alone, in which case the address observed on this connection is used. The
+// second form is what lets a client work without knowing its own routable IP.
+bool resolve_peer(int fd, const std::string &token, std::string &out) {
+    if (token.find(':') != std::string::npos) {
+        std::string host;
+        uint16_t port = 0;
+        if (!proto::parse_endpoint(token, host, port)) return false;
+        out = token;
+        return true;
+    }
+    uint16_t port = 0;
+    if (!proto::parse_port(token, port)) return false;
+    std::string ip = proto::peer_address(fd);
+    if (ip.empty()) return false;
+    out = proto::make_endpoint(ip, port);
+    return true;
 }
 
-void save() {
-    mkdir(data_dir.c_str(), 0755);
+void persist_locked() { tracker::save(g_state, g_data_dir); }
 
-    ofstream uf(data_dir + "/users.txt");
-    for(auto& p : users) {
-        uf << p.first << " " << p.second.pass << "\n";
-    }
-    uf.close();
+// ---------------------------------------------------------------------------
+// Replication ops.
+//
+// Each op is an absolute, idempotent statement about the desired state ("user X
+// has password P", "group G contains member U") rather than a delta. Applying
+// one twice, or applying it to a tracker that already agrees, is a no-op, so a
+// redelivered or snapshot-overlapping op can never corrupt the replica.
+// ---------------------------------------------------------------------------
 
-    ofstream gf(data_dir + "/groups.txt");
-    for(auto& p : groups) {
-        gf << p.first << " " << p.second.first;
-        for(auto& m : p.second.second) gf << " " << m;
-        gf << "\n";
-    }
-    gf.close();
+void apply_op_locked(const std::string &op) {
+    std::istringstream iss(op);
+    std::string kind;
+    if (!(iss >> kind)) return;
 
-    ofstream rf(data_dir + "/requests.txt");
-    for(auto& p : requests) {
-        if(!p.second.empty()) {
-            rf << p.first;
-            for(auto& u : p.second) rf << " " << u;
-            rf << "\n";
+    if (kind == "USER") {
+        std::string user, pass;
+        if (iss >> user >> pass) g_state.users[user].password = pass;
+
+    } else if (kind == "ONLINE") {
+        std::string user, flag;
+        if (iss >> user >> flag) {
+            auto it = g_state.users.find(user);
+            if (it != g_state.users.end()) it->second.online = (flag == "1");
         }
-    }
-    rf.close();
 
-    ofstream ff(data_dir + "/files.txt");
-    for(auto& p : files) {
-        auto& f = p.second;
-        ff << f.group << " " << f.filename << " " << f.size << " " << f.piece_sha.size() << " " << f.sha << " " << f.owner;
-        for(size_t i = 0; i < f.piece_sha.size(); i++) ff << (i ? "," : " ") << f.piece_sha[i];
-        for(auto& peer : f.peers) ff << " " << peer;
-        ff << "\n";
-    }
-    ff.close();
-
-    cout << "Data saved to " << data_dir << endl;
-}
-
-void load() {
-    data_dir = "tracker_data_" + to_string(self_idx);
-    cout << "Loading data from " << data_dir << endl;
-
-    ifstream uf(data_dir + "/users.txt"), gf(data_dir + "/groups.txt"), rf(data_dir + "/requests.txt"), ff(data_dir + "/files.txt");
-    string line, u, p, g, o, m;
-
-    // Load users
-    while(getline(uf, line) && !line.empty()) {
-        istringstream iss(line);
-        if(iss >> u >> p) {
-            users[u] = User(p);
-            cout << "Loaded user: " << u << endl;
+    } else if (kind == "GROUP") {
+        std::string group, owner;
+        if (iss >> group >> owner) {
+            Group &g = g_state.groups[group];
+            if (g.owner.empty()) g.owner = owner;
+            g.members.insert(owner);
         }
-    }
 
-    // Load groups
-    while(getline(gf, line) && !line.empty()) {
-        istringstream iss(line);
-        if(iss >> g >> o) {
-            set<string> members;
-            while(iss >> m) members.insert(m);
-            groups[g] = make_pair(o, members);
-            cout << "Loaded group: " << g << " owner: " << o << endl;
-        }
-    }
-
-    // Load requests
-    while(getline(rf, line) && !line.empty()) {
-        istringstream iss(line);
-        if(iss >> g) {
-            vector<string> reqs;
-            while(iss >> u) reqs.push_back(u);
-            requests[g] = reqs;
-            cout << "Loaded requests for group: " << g << endl;
-        }
-    }
-
-    // Load files
-    while(getline(ff, line) && !line.empty()) {
-        istringstream iss(line);
-        File file;
-        string np_str, token;
-        if(iss >> file.group >> file.filename >> file.size >> np_str >> file.sha >> file.owner && iss >> token) {
-            int np = stoi(np_str);
-            size_t pos = 0;
-            while(pos < token.size() && (int)file.piece_sha.size() < np) {
-                while(pos < token.size() && !isxdigit(token[pos])) pos++;
-                if(pos + 40 <= token.size()) {
-                    file.piece_sha.push_back(token.substr(pos, 40));
-                    pos += 40;
-                }
+    } else if (kind == "MEMBER") {
+        std::string group, user;
+        if (iss >> group >> user) {
+            auto it = g_state.groups.find(group);
+            if (it != g_state.groups.end()) {
+                it->second.members.insert(user);
+                auto &p = it->second.pending;
+                p.erase(std::remove(p.begin(), p.end(), user), p.end());
             }
-            while(iss >> token) file.peers.insert(token);
-            files[file.group + " " + file.filename] = file;
-            cout << "Loaded file: " << file.filename << " in group: " << file.group << endl;
         }
-    }
-}
 
-bool send_to(const string& ep, const string& msg) {
-    size_t p = ep.find(':');
-    if(p == string::npos) return false;
+    } else if (kind == "REQUEST" || kind == "UNREQUEST") {
+        std::string group, user;
+        if (iss >> group >> user) {
+            auto it = g_state.groups.find(group);
+            if (it != g_state.groups.end()) {
+                auto &p = it->second.pending;
+                p.erase(std::remove(p.begin(), p.end(), user), p.end());
+                if (kind == "REQUEST" && !it->second.members.count(user)) p.push_back(user);
+            }
+        }
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if(fd < 0) return false;
+    } else if (kind == "LEAVE") {
+        std::string group, user;
+        if (iss >> group >> user) {
+            auto it = g_state.groups.find(group);
+            if (it == g_state.groups.end()) return;
+            it->second.members.erase(user);
+            auto &p = it->second.pending;
+            p.erase(std::remove(p.begin(), p.end(), user), p.end());
 
-    struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-    sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(stoi(ep.substr(p+1)));
-    sa.sin_addr.s_addr = inet_addr(ep.substr(0,p).c_str());
-
-    if(connect(fd, (sockaddr*)&sa, sizeof(sa)) < 0) {
-        close(fd);
-        return false;
-    }
-
-    bool ok = send_msg(fd, msg);
-    if(ok) {
-        string rep;
-        recv_msg(fd, rep);
-    }
-    close(fd);
-    return ok;
-}
-
-void sync(const string& cmd) {
-    thread([cmd]() {
-        for(size_t i = 0; i < trackers.size(); ++i) {
-            if((int)i != self_idx) {
-                if(!send_to(trackers[i], "SYNC " + cmd)) {
-                    cout << "Warning: Failed to sync to tracker " << i << ": " << trackers[i] << endl;
+            // A member who leaves stops sharing whatever they own in the group.
+            for (auto f = g_state.files.begin(); f != g_state.files.end();) {
+                if (f->second.group == group && f->second.owner == user)
+                    f = g_state.files.erase(f);
+                else
+                    ++f;
+            }
+            if (it->second.owner == user) {
+                if (it->second.members.empty()) {
+                    g_state.groups.erase(it);
                 } else {
-                    cout << "Synced to tracker " << i << ": " << cmd << endl;
+                    // members is ordered, so both trackers elect the same
+                    // successor without having to exchange anything.
+                    it->second.owner = *it->second.members.begin();
                 }
             }
         }
-    }).detach();
-}
 
-// Handle sync operations with UPLOAD_META prefix handling
-void handle_sync(const string& sync_data) {
-    istringstream iss(sync_data);
-    string cmd;
-    if(!(iss >> cmd)) return;
+    } else if (kind == "DELGROUP") {
+        std::string group;
+        if (iss >> group) g_state.groups.erase(group);
 
-    cout << "Processing sync: " << sync_data << endl;
-
-    if(cmd == "REGISTER") {
-        string user, pass;
-        if(iss >> user >> pass) {
-            users[user] = User(pass);
-            cout << "Synced user registration: " << user << endl;
+    } else if (kind == "FILE") {
+        FileMeta f;
+        std::string np_tok, size_tok;
+        uint64_t np = 0;
+        if (!(iss >> f.group >> f.name >> size_tok >> np_tok >> f.file_sha >> f.owner)) return;
+        if (!parse_u64(size_tok, f.size) || !parse_u64(np_tok, np)) return;
+        if (!sha1::is_hex(f.file_sha)) return;
+        std::string h;
+        while (iss >> h && f.piece_sha.size() < np) {
+            if (!sha1::is_hex(h)) return;
+            f.piece_sha.push_back(h);
         }
-    }
-    else if(cmd == "CREATE_GROUP") {
-        string user, group;
-        if(iss >> user >> group) {
-            set<string> members; 
-            members.insert(user);
-            groups[group] = make_pair(user, members);
-            cout << "Synced group creation: " << group << " by " << user << endl;
-        }
-    }
-    else if(cmd == "JOIN_GROUP") {
-        string user, group;
-        if(iss >> user >> group) {
-            auto& v = requests[group];
-            if(find(v.begin(), v.end(), user) == v.end()) {
-                v.push_back(user);
-                cout << "Synced join request: " << user << " -> " << group << endl;
-            }
-        }
-    }
-    else if(cmd == "ACCEPT_REQUEST") {
-        string group, user;
-        if(iss >> group >> user) {
-            auto& v = requests[group];
-            auto it = find(v.begin(), v.end(), user);
-            if(it != v.end()) {
-                v.erase(it);
-                groups[group].second.insert(user);
-                cout << "Synced request acceptance: " << user << " joined " << group << endl;
-            }
-        }
-    }
-    else if(cmd == "LEAVE_GROUP") {
-        string user, group;
-        if(iss >> user >> group) {
-            auto git = groups.find(group);
-            if(git != groups.end() && git->second.second.count(user)) {
-                git->second.second.erase(user);
+        if (f.piece_sha.size() != np) return;
 
-                // Remove files owned by leaving user
-                for(auto it = files.begin(); it != files.end();) {
-                    if(it->second.group == group && it->second.owner == user) {
-                        it = files.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-
-                if(git->second.first == user) {
-                    if(git->second.second.empty()) {
-                        groups.erase(group);
-                        requests.erase(group);
-                    } else {
-                        git->second.first = *git->second.second.begin();
-                    }
-                }
-                cout << "Synced group leave: " << user << " left " << group << endl;
-            }
+        std::string key = tracker::file_key(f.group, f.name);
+        auto it = g_state.files.find(key);
+        if (it == g_state.files.end()) {
+            g_state.files[key] = f;
+        } else {
+            // Metadata is replaced, the seeder set is not: peers are local
+            // knowledge each tracker accumulates from PEER/UNPEER ops.
+            f.peers = it->second.peers;
+            it->second = f;
         }
-    }
-    else if(cmd == "STOP_SHARE") {
-        string group, filename, peer;
-        if(iss >> group >> filename >> peer) {
-            string key = group + " " + filename;
-            auto it = files.find(key);
-            if(it != files.end()) {
-                it->second.peers.erase(peer);
-                if(it->second.peers.empty()) {
-                    files.erase(it);
-                    cout << "Synced file removal: " << filename << " from " << group << endl;
-                } else {
-                    cout << "Synced peer removal: " << peer << " from " << filename << endl;
-                }
-            }
-        }
-    }
-    else if(cmd == "ADD_PEER") {
-        string group, filename, peer;
-        if(iss >> group >> filename >> peer) {
-            string key = group + " " + filename;
-            auto it = files.find(key);
-            if(it != files.end()) {
-                it->second.peers.insert(peer);
-                cout << "Synced peer addition: " << peer << " to " << filename << endl;
-            }
-        }
-    }
-    else if(cmd == "UPLOAD_META") {
-        File file;
-        string peer, user, np_str;
-        if(iss >> file.group >> file.filename >> file.size >> np_str >> file.sha >> peer >> user) {
-            int np = stoi(np_str);
 
-            string hash;
-            while(iss >> hash && (int)file.piece_sha.size() < np) {
-                if(hash.length() == 40) {
-                    file.piece_sha.push_back(hash);
-                }
-            }
-
-            if((int)file.piece_sha.size() == np) {
-                file.owner = user;
-                file.peers.insert(peer);
-                files[file.group + " " + file.filename] = file;
-                cout << "Synced file upload: " << file.filename << " in " << file.group << " by " << user << endl;
-            }
-        }
-    }
-    else {
-        // Handle file upload sync without UPLOAD_META prefix
-        // Reset the istringstream to process the entire sync_data as file upload
-        istringstream file_iss(sync_data);
-        File file;
-        string peer, user, np_str;
-        if(file_iss >> file.group >> file.filename >> file.size >> np_str >> file.sha >> peer >> user) {
-            int np = stoi(np_str);
-
-            string hash;
-            while(file_iss >> hash && (int)file.piece_sha.size() < np) {
-                if(hash.length() == 40) {
-                    file.piece_sha.push_back(hash);
-                }
-            }
-
-            if((int)file.piece_sha.size() == np) {
-                file.owner = user;
-                file.peers.insert(peer);
-                files[file.group + " " + file.filename] = file;
-                cout << "Synced file upload (auto-detected): " << file.filename << " in " << file.group << " by " << user << endl;
+    } else if (kind == "PEER" || kind == "UNPEER") {
+        std::string group, name, peer;
+        if (iss >> group >> name >> peer) {
+            FileMeta *f = g_state.find_file(group, name);
+            if (!f) return;
+            if (kind == "PEER") {
+                f->peers.insert(peer);
             } else {
-                cout << "Unknown sync command: " << cmd << endl;
-            }
-        } else {
-            cout << "Unknown sync command: " << cmd << endl;
-        }
-    }
-
-    // Save immediately after sync processing
-    save();
-}
-
-void handle(const vector<string>& parts, int fd) {
-    string cmd = parts[0];
-
-    if(cmd == "REGISTER" && parts.size() == 3) {
-        lock_guard<mutex> g(mtx);
-        if(users.count(parts[1])) {
-            send_msg(fd, "ERR user_exists");
-        } else {
-            users[parts[1]] = User(parts[2]);
-            save(); // Save immediately
-            send_msg(fd, "OK");
-            sync("REGISTER " + parts[1] + " " + parts[2]);
-        }
-    }
-    else if(cmd == "LOGIN" && parts.size() == 3) {
-        lock_guard<mutex> g(mtx);
-        auto it = users.find(parts[1]);
-        if(it == users.end()) {
-            send_msg(fd, "ERR user_not_found");
-        } else if(it->second.pass != parts[2]) {
-            send_msg(fd, "ERR wrong_password");
-        } else {
-            it->second.logged = true;
-            save(); // Save login state
-            send_msg(fd, "OK");
-        }
-    }
-    else if(cmd == "CREATE_GROUP" && parts.size() == 3) {
-        lock_guard<mutex> g(mtx);
-        if(groups.count(parts[2])) {
-            send_msg(fd, "ERR grp_exists");
-        } else {
-            set<string> members; 
-            members.insert(parts[1]); 
-            groups[parts[2]] = make_pair(parts[1], members);
-            save(); // Save immediately
-            send_msg(fd, "OK");
-            sync("CREATE_GROUP " + parts[1] + " " + parts[2]);
-        }
-    }
-    else if(cmd == "JOIN_GROUP" && parts.size() == 3) {
-        lock_guard<mutex> g(mtx);
-        if(!groups.count(parts[2])) {
-            send_msg(fd, "ERR no_group");
-        } else if(member(parts[1], parts[2])) {
-            send_msg(fd, "ERR already_member");
-        } else {
-            auto& v = requests[parts[2]]; 
-            if(find(v.begin(), v.end(), parts[1]) == v.end()) v.push_back(parts[1]);
-            save(); // Save immediately
-            send_msg(fd, "OK");
-            sync("JOIN_GROUP " + parts[1] + " " + parts[2]);
-        }
-    }
-    else if(cmd == "LIST_GROUPS") {
-        lock_guard<mutex> g(mtx);
-        string out;
-        for(auto& p : groups) {
-            out += p.first + "\n";
-        }
-        send_msg(fd, out);
-    }
-    else if(cmd == "LIST_REQUESTS" && parts.size() == 3) {
-        lock_guard<mutex> g(mtx);
-        if(!owner(parts[2], parts[1])) {
-            send_msg(fd, "ERR not_owner");
-        } else {
-            string out;
-            for(auto& u : requests[parts[1]]) out += u + "\n";
-            send_msg(fd, out);
-        }
-    }
-    else if(cmd == "ACCEPT_REQUEST" && parts.size() == 4) {
-        lock_guard<mutex> g(mtx);
-        if(!owner(parts[3], parts[1])) {
-            send_msg(fd, "ERR not_owner");
-        } else {
-            auto& v = requests[parts[1]];
-            auto it = find(v.begin(), v.end(), parts[2]);
-            if(it == v.end()) {
-                send_msg(fd, "ERR no_request");
-            } else {
-                v.erase(it);
-                groups[parts[1]].second.insert(parts[2]);
-                save(); // Save immediately
-                send_msg(fd, "OK");
-                sync("ACCEPT_REQUEST " + parts[1] + " " + parts[2]);
-            }
-        }
-    }
-    else if(cmd == "LEAVE_GROUP" && parts.size() == 3) {
-        lock_guard<mutex> g(mtx);
-        if(!member(parts[1], parts[2])) {
-            send_msg(fd, "ERR not_member");
-        } else {
-            auto& gi = groups[parts[2]];
-            gi.second.erase(parts[1]);
-
-            for(auto it = files.begin(); it != files.end();) {
-                if(it->second.group == parts[2] && it->second.owner == parts[1]) {
-                    it = files.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-
-            if(gi.first == parts[1]) {
-                if(gi.second.empty()) {
-                    groups.erase(parts[2]);
-                    requests.erase(parts[2]);
-                } else {
-                    gi.first = *gi.second.begin();
-                }
-            }
-            save(); // Save immediately
-            send_msg(fd, "OK");
-            sync("LEAVE_GROUP " + parts[1] + " " + parts[2]);
-        }
-    }
-    else if(cmd == "LIST_FILES" && parts.size() == 3) {
-        lock_guard<mutex> g(mtx);
-        if(!member(parts[2], parts[1])) {
-            send_msg(fd, "ERR not_member");
-        } else {
-            string out;
-            for(auto& p : files) {
-                if(p.second.group == parts[1]) out += p.second.filename + "\n";
-            }
-            send_msg(fd, out);
-        }
-    }
-    else if(cmd == "GET_FILE_PEERS" && parts.size() == 4) {
-        lock_guard<mutex> g(mtx);
-        string key = parts[1] + " " + parts[2];
-        if(!member(parts[3], parts[1])) {
-            send_msg(fd, "ERR not_member");
-        } else {
-            auto it = files.find(key);
-            if(it == files.end()) {
-                send_msg(fd, "ERR no_file");
-            } else if(it->second.peers.empty()) {
-                send_msg(fd, "ERR no_peers_available");
-            } else {
-                auto& f = it->second;
-                string out = to_string(f.size) + " " + to_string(f.piece_sha.size()) + "\n" + f.sha + "\n";
-                for(size_t i = 0; i < f.piece_sha.size(); i++) out += (i ? "," : "") + f.piece_sha[i];
-                out += "\nPEERS\n";
-                for(auto& p : f.peers) out += p + "\n";
-                send_msg(fd, out);
-            }
-        }
-    }
-    else if(cmd == "STOP_SHARE" && parts.size() == 4) {
-        lock_guard<mutex> g(mtx);
-        string key = parts[1] + " " + parts[2];
-        auto it = files.find(key);
-        if(it != files.end()) {
-            it->second.peers.erase(parts[3]);
-            if(it->second.peers.empty()) files.erase(it);
-        }
-        save(); // Save immediately
-        send_msg(fd, "OK");
-        sync("STOP_SHARE " + parts[1] + " " + parts[2] + " " + parts[3]);
-    }
-    else if(cmd == "ADD_PEER" && parts.size() == 4) {
-        lock_guard<mutex> g(mtx);
-        string key = parts[1] + " " + parts[2];
-        auto it = files.find(key);
-        if(it != files.end()) it->second.peers.insert(parts[3]);
-        save(); // Save immediately
-        send_msg(fd, "OK");
-        sync("ADD_PEER " + parts[1] + " " + parts[2] + " " + parts[3]);
-    }
-    else if(cmd.substr(0, 11) == "UPLOAD_META") {
-        string full = cmd;
-        for(size_t i = 1; i < parts.size(); i++) full += " " + parts[i];
-
-        istringstream iss(full.substr(12));
-        File file;
-        string peer, user, np_str;
-        iss >> file.group >> file.filename >> file.size >> np_str >> file.sha >> peer >> user;
-        int np = stoi(np_str);
-
-        string hash;
-        while(iss >> hash && (int)file.piece_sha.size() < np) {
-            if(hash.length() == 40) {
-                file.piece_sha.push_back(hash);
+                f->peers.erase(peer);
+                if (f->peers.empty()) g_state.files.erase(tracker::file_key(group, name));
             }
         }
 
-        lock_guard<mutex> g(mtx);
-        if(!member(user, file.group)) {
-            send_msg(fd, "ERR not_member");
-        } else if((int)file.piece_sha.size() != np) {
-            send_msg(fd, "ERR piece_count_mismatch");
-        } else {
-            file.owner = user;
-            file.peers.insert(peer);
-            files[file.group + " " + file.filename] = file;
-            save(); // Save immediately
-            send_msg(fd, "OK");
-            // Send with UPLOAD_META prefix for sync handling
-            sync("UPLOAD_META " + full.substr(12));
-        }
-    }
-    else if(cmd == "SYNC" && parts.size() >= 2) {
-        string sync_data;
-        for(size_t i = 1; i < parts.size(); i++) {
-            if(i > 1) sync_data += " ";
-            sync_data += parts[i];
-        }
-
-        if(!sync_data.empty()) {
-            lock_guard<mutex> g(mtx);
-            handle_sync(sync_data);
-        }
-        send_msg(fd, "OK");
-    }
-    else {
-        send_msg(fd, "ERR unknown_cmd");
+    } else if (kind == "DROPPEER") {
+        std::string peer;
+        if (iss >> peer) g_state.drop_peer(peer);
     }
 }
 
-void client_loop(int fd) {
-    string msg;
-    while(recv_msg(fd, msg) && !msg.empty()) {
-        auto parts = split_ws(msg);
-        if(!parts.empty()) handle(parts, fd);
-    }
-    close(fd);
+// Applies an op locally and forwards it. Received SYNC ops are applied with
+// apply_op_locked() directly instead, which is what keeps them from echoing back
+// and forth between the two trackers forever.
+void commit_locked(const std::string &op) {
+    apply_op_locked(op);
+    g_replicator.broadcast(op);
 }
+
+// ---------------------------------------------------------------------------
+// Client request handling. Every reply starts with a status line: "OK",
+// optionally followed by payload lines, or "ERR <code>".
+// ---------------------------------------------------------------------------
+
+std::string err(const char *code) { return std::string("ERR ") + code; }
+
+// Session check. There are no session tokens: a client asserts its identity and
+// the tracker verifies that the account exists and is currently logged in. See
+// the README's security note.
+bool authorised(const std::string &user) {
+    auto it = g_state.users.find(user);
+    return it != g_state.users.end() && it->second.online;
+}
+
+std::string handle_register(const std::vector<std::string> &a) {
+    if (a.size() != 3) return err("bad_request");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_state.users.count(a[1])) return err("user_exists");
+    commit_locked("USER " + a[1] + " " + a[2]);
+    persist_locked();
+    return "OK";
+}
+
+std::string handle_login(int fd, const std::vector<std::string> &a) {
+    if (a.size() != 4) return err("bad_request");
+    std::string peer;
+    if (!resolve_peer(fd, a[3], peer)) return err("bad_request");
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_state.users.find(a[1]);
+    if (it == g_state.users.end()) return err("user_not_found");
+    if (it->second.password != a[2]) return err("wrong_password");
+    commit_locked("ONLINE " + a[1] + " 1");
+    return "OK " + peer;
+}
+
+std::string handle_logout(int fd, const std::vector<std::string> &a) {
+    if (a.size() != 3) return err("bad_request");
+    std::string peer;
+    if (!resolve_peer(fd, a[2], peer)) return err("bad_request");
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_state.users.count(a[1])) return err("user_not_found");
+    // Logging out means "stop sharing": the endpoint disappears from every file
+    // it was seeding, so no client is ever handed a peer that has gone away.
+    commit_locked("DROPPEER " + peer);
+    commit_locked("ONLINE " + a[1] + " 0");
+    persist_locked();
+    return "OK";
+}
+
+std::string handle_create_group(const std::vector<std::string> &a) {
+    if (a.size() != 3) return err("bad_request");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(a[1])) return err("not_logged_in");
+    if (g_state.groups.count(a[2])) return err("group_exists");
+    commit_locked("GROUP " + a[2] + " " + a[1]);
+    persist_locked();
+    return "OK";
+}
+
+std::string handle_join_group(const std::vector<std::string> &a) {
+    if (a.size() != 3) return err("bad_request");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(a[1])) return err("not_logged_in");
+    auto it = g_state.groups.find(a[2]);
+    if (it == g_state.groups.end()) return err("no_such_group");
+    if (it->second.members.count(a[1])) return err("already_member");
+    for (const auto &p : it->second.pending)
+        if (p == a[1]) return err("already_requested");
+    commit_locked("REQUEST " + a[2] + " " + a[1]);
+    persist_locked();
+    return "OK";
+}
+
+std::string handle_leave_group(const std::vector<std::string> &a) {
+    if (a.size() != 3) return err("bad_request");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(a[1])) return err("not_logged_in");
+    if (!g_state.is_member(a[1], a[2])) return err("not_member");
+    commit_locked("LEAVE " + a[2] + " " + a[1]);
+    persist_locked();
+    return "OK";
+}
+
+std::string handle_list_groups(const std::vector<std::string> &a) {
+    if (a.size() != 2) return err("bad_request");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(a[1])) return err("not_logged_in");
+    std::string out = "OK";
+    for (const auto &kv : g_state.groups)
+        out += "\n" + kv.first + " " + kv.second.owner + " " +
+               std::to_string(kv.second.members.size());
+    return out;
+}
+
+std::string handle_list_requests(const std::vector<std::string> &a) {
+    if (a.size() != 3) return err("bad_request");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(a[1])) return err("not_logged_in");
+    auto it = g_state.groups.find(a[2]);
+    if (it == g_state.groups.end()) return err("no_such_group");
+    if (it->second.owner != a[1]) return err("not_owner");
+    std::string out = "OK";
+    for (const auto &u : it->second.pending) out += "\n" + u;
+    return out;
+}
+
+std::string handle_accept_request(const std::vector<std::string> &a) {
+    if (a.size() != 4) return err("bad_request");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(a[1])) return err("not_logged_in");
+    auto it = g_state.groups.find(a[2]);
+    if (it == g_state.groups.end()) return err("no_such_group");
+    if (it->second.owner != a[1]) return err("not_owner");
+
+    bool pending = false;
+    for (const auto &u : it->second.pending) pending = pending || u == a[3];
+    if (!pending) return err("no_request");
+
+    commit_locked("MEMBER " + a[2] + " " + a[3]);
+    persist_locked();
+    return "OK";
+}
+
+std::string handle_upload_file(int fd, const std::vector<std::string> &a) {
+    // UPLOAD_FILE <user> <peer> <group> <name> <size> <npieces> <file_sha> <hash>...
+    if (a.size() < 8) return err("bad_request");
+
+    std::string peer;
+    if (!resolve_peer(fd, a[2], peer)) return err("bad_request");
+
+    FileMeta f;
+    f.group = a[3];
+    f.name = a[4];
+    f.owner = a[1];
+    f.file_sha = a[7];
+    uint64_t npieces = 0;
+    if (!parse_u64(a[5], f.size) || !parse_u64(a[6], npieces)) return err("bad_request");
+    if (!sha1::is_hex(f.file_sha)) return err("bad_request");
+    if (a.size() != 8 + npieces) return err("piece_count_mismatch");
+    for (size_t i = 8; i < a.size(); i++) {
+        if (!sha1::is_hex(a[i])) return err("bad_request");
+        f.piece_sha.push_back(a[i]);
+    }
+    f.peers.insert(peer);
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(f.owner)) return err("not_logged_in");
+    if (!g_state.is_member(f.owner, f.group)) return err("not_member");
+
+    const FileMeta *existing = g_state.find_file(f.group, f.name);
+    if (existing && existing->file_sha != f.file_sha) return err("file_exists");
+
+    std::string op = "FILE " + f.group + " " + f.name + " " + std::to_string(f.size) + " " +
+                     std::to_string(f.piece_sha.size()) + " " + f.file_sha + " " + f.owner;
+    for (const auto &h : f.piece_sha) op += " " + h;
+    commit_locked(op);
+    commit_locked("PEER " + f.group + " " + f.name + " " + peer);
+    persist_locked();
+    return "OK";
+}
+
+std::string handle_list_files(const std::vector<std::string> &a) {
+    if (a.size() != 3) return err("bad_request");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(a[1])) return err("not_logged_in");
+    if (!g_state.groups.count(a[2])) return err("no_such_group");
+    if (!g_state.is_member(a[1], a[2])) return err("not_member");
+
+    std::string out = "OK";
+    for (const auto &kv : g_state.files) {
+        const FileMeta &f = kv.second;
+        if (f.group != a[2]) continue;
+        out += "\n" + f.name + " " + std::to_string(f.size) + " " + std::to_string(f.peers.size());
+    }
+    return out;
+}
+
+std::string handle_get_file(const std::vector<std::string> &a) {
+    if (a.size() != 4) return err("bad_request");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(a[1])) return err("not_logged_in");
+    if (!g_state.is_member(a[1], a[2])) return err("not_member");
+
+    const FileMeta *f = g_state.find_file(a[2], a[3]);
+    if (!f) return err("no_such_file");
+    if (f->peers.empty()) return err("no_peers");
+
+    // OK
+    // <size> <npieces> <file_sha>
+    // <piece hash> * npieces, one per line
+    // <peer endpoint> * n, one per line
+    std::string out = "OK\n" + std::to_string(f->size) + " " +
+                      std::to_string(f->piece_sha.size()) + " " + f->file_sha + "\n";
+    for (const auto &h : f->piece_sha) out += h + "\n";
+    out += "PEERS\n";
+    for (const auto &p : f->peers) out += p + "\n";
+    return out;
+}
+
+std::string handle_add_peer(int fd, const std::vector<std::string> &a) {
+    if (a.size() != 5) return err("bad_request");
+    std::string peer;
+    if (!resolve_peer(fd, a[2], peer)) return err("bad_request");
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(a[1])) return err("not_logged_in");
+    if (!g_state.is_member(a[1], a[3])) return err("not_member");
+    if (!g_state.find_file(a[3], a[4])) return err("no_such_file");
+    commit_locked("PEER " + a[3] + " " + a[4] + " " + peer);
+    persist_locked();
+    return "OK";
+}
+
+std::string handle_stop_share(int fd, const std::vector<std::string> &a) {
+    if (a.size() != 5) return err("bad_request");
+    std::string peer;
+    if (!resolve_peer(fd, a[2], peer)) return err("bad_request");
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!authorised(a[1])) return err("not_logged_in");
+    const FileMeta *f = g_state.find_file(a[3], a[4]);
+    if (!f) return err("no_such_file");
+    if (!f->peers.count(peer)) return err("not_sharing");
+    commit_locked("UNPEER " + a[3] + " " + a[4] + " " + peer);
+    persist_locked();
+    return "OK";
+}
+
+std::string handle_sync(const std::string &request) {
+    // "SYNC " prefix stripped by the caller.
+    std::lock_guard<std::mutex> lock(g_mutex);
+    apply_op_locked(request);
+    persist_locked();
+    return "OK";
+}
+
+std::string handle_snapshot() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return "OK\n" + tracker::encode(g_state);
+}
+
+std::string dispatch(int fd, const std::string &request) {
+    std::vector<std::string> a = proto::split_ws(request);
+    if (a.empty()) return err("bad_request");
+    const std::string &cmd = a[0];
+
+    if (cmd == "REGISTER") return handle_register(a);
+    if (cmd == "LOGIN") return handle_login(fd, a);
+    if (cmd == "LOGOUT") return handle_logout(fd, a);
+    if (cmd == "CREATE_GROUP") return handle_create_group(a);
+    if (cmd == "JOIN_GROUP") return handle_join_group(a);
+    if (cmd == "LEAVE_GROUP") return handle_leave_group(a);
+    if (cmd == "LIST_GROUPS") return handle_list_groups(a);
+    if (cmd == "LIST_REQUESTS") return handle_list_requests(a);
+    if (cmd == "ACCEPT_REQUEST") return handle_accept_request(a);
+    if (cmd == "UPLOAD_FILE") return handle_upload_file(fd, a);
+    if (cmd == "LIST_FILES") return handle_list_files(a);
+    if (cmd == "GET_FILE") return handle_get_file(a);
+    if (cmd == "ADD_PEER") return handle_add_peer(fd, a);
+    if (cmd == "STOP_SHARE") return handle_stop_share(fd, a);
+    if (cmd == "SNAPSHOT") return handle_snapshot();
+    if (cmd == "SYNC") {
+        size_t sp = request.find(' ');
+        if (sp == std::string::npos) return err("bad_request");
+        return handle_sync(request.substr(sp + 1));
+    }
+    return err("unknown_command");
+}
+
+// One connection, many requests: clients keep the socket open for the duration
+// of a command and trackers reuse it for a whole batch of sync ops.
+void serve_connection(int fd) {
+    std::string request;
+    while (proto::recv_msg(fd, request)) {
+        std::string reply;
+        try {
+            reply = dispatch(fd, request);
+        } catch (const std::exception &e) {
+            // A failure while serving one request must not take down the
+            // tracker; report it and keep the other connections alive.
+            std::fprintf(stderr, "[tracker] request failed: %s\n", e.what());
+            reply = err("internal_error");
+        }
+        if (!proto::send_msg(fd, reply)) break;
+    }
+    ::close(fd);
+}
+
+// Signals g_running false and closes the listening socket exactly once. Closing
+// (not shutdown()) is what actually matters here: shutdown() only has a defined
+// effect on a *connected* socket, so calling it on a listening fd does not wake a
+// different thread blocked in accept() on it - the tracker would then sit there
+// until a real connection happened to arrive. close() from another thread does
+// reliably unblock a concurrent accept() with EBADF on Linux, which is what both
+// the console's 'quit' and a caught signal need. The exchange() makes this safe
+// to call from both places (and from main's own cleanup) without double-closing.
+void request_shutdown() {
+    g_running.store(false);
+    int fd = g_listen_fd.exchange(-1);
+    if (fd >= 0) ::close(fd);
+}
+
+void console_thread() {
+    std::string line;
+    while (g_running.load()) {
+        // Wait for stdin to become readable rather than parking inside getline().
+        // Two reasons: a shutdown requested elsewhere (a signal) is noticed within
+        // one poll interval, and - more importantly - the thread is not sitting in
+        // a blocking read at process-exit time. exit() walks every open FILE stream
+        // to flush it and takes each one's lock; a reader blocked on stdin holds
+        // stdin's lock for the whole read, so exit() would deadlock there until the
+        // read happened to complete (i.e. until the user pressed Ctrl+D).
+        pollfd pfd;
+        pfd.fd = STDIN_FILENO;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = ::poll(&pfd, 1, kConsolePollMs);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        if (pr == 0) continue;  // nothing typed yet; recheck g_running
+
+        // Readable also covers EOF, where getline() fails immediately: no console
+        // is attached (stdin redirected or closed). That is not a reason to stop
+        // serving; only an explicit 'quit' or a signal shuts the tracker down.
+        if (!std::getline(std::cin, line)) return;
+
+        std::vector<std::string> a = proto::split_ws(line);
+        if (a.empty()) continue;
+
+        if (a[0] == "quit") {
+            break;
+        } else if (a[0] == "save") {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            persist_locked();
+            std::cout << "state written to " << g_data_dir << "/state.txt" << std::endl;
+        } else if (a[0] == "status") {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            size_t online = 0;
+            for (const auto &kv : g_state.users) online += kv.second.online ? 1 : 0;
+            std::cout << "users=" << g_state.users.size() << " (online " << online << ")"
+                      << " groups=" << g_state.groups.size() << " files=" << g_state.files.size()
+                      << std::endl;
+        } else if (a[0] == "files") {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            for (const auto &kv : g_state.files)
+                std::cout << kv.first << " size=" << kv.second.size
+                          << " pieces=" << kv.second.piece_sha.size()
+                          << " seeders=" << kv.second.peers.size() << std::endl;
+        } else if (a[0] == "groups") {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            for (const auto &kv : g_state.groups)
+                std::cout << kv.first << " owner=" << kv.second.owner
+                          << " members=" << kv.second.members.size()
+                          << " pending=" << kv.second.pending.size() << std::endl;
+        } else if (a[0] == "help") {
+            std::cout << "commands: status | groups | files | save | quit" << std::endl;
+        } else {
+            std::cout << "unknown command (try 'help')" << std::endl;
+        }
+    }
+
+    request_shutdown();
+}
+
+void on_signal(int) {
+    // close() is on the POSIX async-signal-safe list, so this is safe to run
+    // directly from a signal handler.
+    request_shutdown();
+}
+
+}  // namespace
 
 int main(int argc, char **argv) {
-    if(argc < 3) {
-        cerr << "Usage: tracker tracker_info.txt <idx>\n";
+    if (argc != 3) {
+        std::fprintf(stderr, "Usage: %s <tracker_info.txt> <tracker_no>\n", argv[0]);
         return 1;
     }
 
-    self_idx = atoi(argv[2]);
-    load();
+    proto::ignore_sigpipe();
 
-    ifstream ifs(argv[1]);
-    string line;
-    while(getline(ifs, line) && !line.empty()) trackers.push_back(line);
-    if(self_idx < 0 || self_idx >= (int)trackers.size()) {
-        cerr << "bad idx\n";
-        return 1;
-    }
-
-    string my = trackers[self_idx];
-    size_t p = my.find(':');
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(stoi(my.substr(p+1)));
-    sa.sin_addr.s_addr = INADDR_ANY;
-
-    bind(fd, (sockaddr*)&sa, sizeof(sa));
-    listen(fd, 20);
-
-    printf("Tracker %d listening on %s\n", self_idx, my.c_str());
-
-    thread([&]() {
-        string cmd;
-        while(getline(cin, cmd) && cmd != "quit") {
-            if(cmd == "save") {
-                lock_guard<mutex> g(mtx);
-                save();
-            } else if(cmd == "status") {
-                lock_guard<mutex> g(mtx);
-                cout << "Users: " << users.size() << ", Groups: " << groups.size() 
-                     << ", Files: " << files.size() << endl;
-            }
+    // Read the tracker directory first: the index has to be validated before it
+    // is used to pick a data directory.
+    {
+        FILE *f = std::fopen(argv[1], "r");
+        if (!f) {
+            std::fprintf(stderr, "cannot open %s\n", argv[1]);
+            return 1;
         }
-        lock_guard<mutex> g(mtx);
-        save();
-        exit(0);
-    }).detach();
-
-    while(true) {
-        int cfd = accept(fd, nullptr, nullptr);
-        if(cfd >= 0) thread(client_loop, cfd).detach();
+        char buf[256];
+        while (std::fgets(buf, sizeof(buf), f)) {
+            std::string line(buf);
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+            if (!line.empty()) g_trackers.push_back(line);
+        }
+        std::fclose(f);
     }
+
+    char *end = nullptr;
+    long idx = std::strtol(argv[2], &end, 10);
+    if (!end || *end != '\0' || idx < 0 || idx >= static_cast<long>(g_trackers.size())) {
+        std::fprintf(stderr, "tracker_no must be between 0 and %zu\n",
+                     g_trackers.empty() ? 0 : g_trackers.size() - 1);
+        return 1;
+    }
+    g_self_index = static_cast<int>(idx);
+
+    std::string host;
+    uint16_t port = 0;
+    if (!proto::parse_endpoint(g_trackers[g_self_index], host, port)) {
+        std::fprintf(stderr, "malformed tracker endpoint: %s\n",
+                     g_trackers[g_self_index].c_str());
+        return 1;
+    }
+
+    g_data_dir = "tracker_data_" + std::to_string(g_self_index);
+    if (tracker::load(g_state, g_data_dir))
+        std::printf("restored %zu user(s), %zu group(s), %zu file(s) from %s\n",
+                    g_state.users.size(), g_state.groups.size(), g_state.files.size(),
+                    g_data_dir.c_str());
+
+    int lfd = proto::listen_on(host, port, kBacklog);
+    if (lfd < 0) return 1;
+    g_listen_fd.store(lfd);
+
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    ::sigaction(SIGINT, &sa, nullptr);
+    ::sigaction(SIGTERM, &sa, nullptr);
+
+    // Merging a peer's snapshot is the recovery path for a tracker that was
+    // offline; it must not overwrite anything we already know, hence merge_only.
+    g_replicator.start(g_trackers, g_self_index, [](const std::string &snapshot) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        tracker::decode_into(g_state, snapshot, /*merge_only=*/true);
+        persist_locked();
+    });
+
+    std::thread console(console_thread);
+
+    std::printf("tracker %d listening on %s (type 'help' for console commands)\n", g_self_index,
+                g_trackers[g_self_index].c_str());
+    std::fflush(stdout);
+
+    while (g_running.load()) {
+        pollfd pfd;
+        pfd.fd = lfd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = ::poll(&pfd, 1, kAcceptPollMs);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;  // genuine error on the listening socket: stop accepting
+        }
+        if (pr == 0) continue;  // timed out; loop back and recheck g_running
+
+        int cfd = ::accept(lfd, nullptr, nullptr);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        proto::set_timeout(cfd, 60);
+        std::thread(serve_connection, cfd).detach();
+    }
+
+    request_shutdown();  // idempotent: no-op if a signal or 'quit' already closed lfd
+
+    g_replicator.stop();
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        persist_locked();
+    }
+    std::printf("tracker %d stopped\n", g_self_index);
+    std::fflush(stdout);
+    std::fflush(stderr);
+
+    // Terminate directly instead of returning, which would call exit().
+    //
+    // exit() flushes and locks every open FILE stream and runs the destructors of
+    // globals such as g_replicator and g_state. Detached threads are still alive
+    // at this point - connection handlers parked in recv(), and the console thread
+    // somewhere around stdin - so both of those steps can block on a lock a
+    // detached thread happens to hold, or race a global being destroyed out from
+    // under it. Nothing here needs that cleanup: the state file has already been
+    // written, and it is updated via rename() so it is never left half-written no
+    // matter when the process dies.
+    console.detach();
+    std::_Exit(0);
 }

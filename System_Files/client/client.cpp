@@ -1,667 +1,466 @@
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <map>
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <algorithm>
-#include <sstream>
-#include <memory>
-#include <cstring>
-#include "../common/proto.h"
-#include "../common/sha1.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
+// Client application.
+//
+// Every client is both a downloader and a seeder: it runs a peer server that
+// serves 512 KB pieces of the files it shares, and a download manager that pulls
+// pieces of other files from several peers at once. The tracker is only ever
+// consulted for metadata - accounts, groups, piece hashes and who to ask.
+//
+// Usage: ./client <IP>:<PORT> tracker_info.txt
+//
+// <IP>:<PORT> is the address this client listens on for peer traffic. If the
+// address given happens to be one of the tracker endpoints from
+// tracker_info.txt, it is instead taken as "connect to this tracker first" and a
+// free port is chosen automatically - both documented invocations work.
+
 #include <sys/stat.h>
+#include <unistd.h>
 
-using namespace std;
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 
-const size_t PIECE_SZ = 524288;
-const int MAX_CONCURRENT = 8;
+#include "../common/proto.h"
+#include "download.h"
+#include "session.h"
+#include "share.h"
 
-static vector<string> trackers;
-static string connected_tracker, current_user;
-static map<string, string> uploaded_files;
-static mutex uploaded_mtx, downloads_mtx;
-static int peer_port = 0;
+namespace {
 
-struct DownloadStatus {
-    string group, filename, dest;
-    int npieces;
-    vector<int> have;
-    atomic<int> remaining;
-    atomic<bool> completed, running;
-    mutex m;
-    DownloadStatus() : npieces(0), remaining(0), completed(false), running(false) {}
-};
+using client::DownloadManager;
+using client::FileInfo;
+using client::ShareRegistry;
+using client::TrackerSession;
 
-static map<string, shared_ptr<DownloadStatus>> downloads;
+TrackerSession g_session;
+ShareRegistry g_shares;
 
-bool connect_send(const string& addr, const string& msg, string& reply) {
-    size_t p = addr.find(':');
-    if(p == string::npos) return false;
+// ---------------------------------------------------------------------------
+// Reply helpers. Tracker replies are a status line ("OK" or "ERR <code>")
+// followed by zero or more payload lines.
+// ---------------------------------------------------------------------------
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if(fd < 0) return false;
-
-    struct timeval timeout;
-    timeout.tv_sec = 10;
-    timeout.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-
-    sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(stoi(addr.substr(p+1)));
-    sa.sin_addr.s_addr = inet_addr(addr.substr(0,p).c_str());
-
-    if(connect(fd, (sockaddr*)&sa, sizeof(sa)) < 0) {
-        close(fd);
-        return false;
+std::vector<std::string> split_lines(const std::string &s) {
+    std::vector<std::string> lines;
+    std::istringstream iss(s);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
     }
-
-    bool ok = send_msg(fd, msg) && recv_msg(fd, reply);
-    close(fd);
-    return ok;
+    return lines;
 }
 
-bool failover_send(const string& msg, string& reply) {
-    if(connect_send(connected_tracker, msg, reply)) return true;
+bool reply_ok(const std::string &reply) { return reply.compare(0, 2, "OK") == 0; }
 
-    for(auto& t : trackers) {
-        if(t != connected_tracker && connect_send(t, msg, reply)) {
-            connected_tracker = t;
-            cout << "Switched to tracker: " << t << endl;
-            return true;
-        }
-    }
-    return false;
+void print_error(const std::string &reply) {
+    std::vector<std::string> lines = split_lines(reply);
+    std::printf("error: %s\n", lines.empty() ? "empty reply" : lines[0].c_str());
 }
 
-void compute_hashes(const string& path, vector<string>& piece_hex, string& file_hex, uint64_t& size) {
-    FILE *f = fopen(path.c_str(), "rb");
-    if(!f) return;
-
-    fseek(f, 0, SEEK_END);
-    size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    size_t np = (size + PIECE_SZ - 1) / PIECE_SZ;
-    piece_hex.clear();
-    piece_hex.reserve(np);
-
-    uint8_t *buf = (uint8_t*)malloc(PIECE_SZ);
-    if(!buf) { fclose(f); return; }
-
-    for(size_t i = 0; i < np; i++) {
-        size_t to_read = (i == np - 1) ? size - i * PIECE_SZ : PIECE_SZ;
-        size_t bytes_read = fread(buf, 1, to_read, f);
-        if(bytes_read != to_read) break;
-
-        char ph[41];
-        sha1_hex(buf, to_read, ph);
-        piece_hex.push_back(string(ph));
-    }
-
-    string concat;
-    for(auto& s : piece_hex) concat += s;
-    char fh[41];
-    sha1_hex((const uint8_t*)concat.data(), concat.size(), fh);
-    file_hex = string(fh);
-
-    free(buf);
-    fclose(f);
-}
-
-void peer_server_thread(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = INADDR_ANY;
-
-    if(bind(fd, (sockaddr*)&sa, sizeof(sa)) < 0) return;
-
-    listen(fd, 50);
-
-    while(true) {
-        int c = accept(fd, nullptr, nullptr);
-        if(c < 0) continue;
-
-        thread([c]() {
-            string rq;
-            if(!recv_msg(c, rq)) {
-                close(c);
-                return;
-            }
-
-            auto parts = split_ws(rq);
-            if(parts.size() != 3 || parts[0] != "GETPIECE") {
-                send_msg(c, "ERR");
-                close(c);
-                return;
-            }
-
-            string filename = parts[1];
-            int idx = stoi(parts[2]);
-            string filepath;
-
-            {
-                lock_guard<mutex> g(uploaded_mtx);
-                auto it = uploaded_files.find(filename);
-                if(it != uploaded_files.end()) {
-                    filepath = it->second;
-                } else {
-                    send_msg(c, "ERR");
-                    close(c);
-                    return;
-                }
-            }
-
-            FILE *f = fopen(filepath.c_str(), "rb");
-            if(!f) {
-                send_msg(c, "ERR");
-                close(c);
-                return;
-            }
-
-            fseek(f, 0, SEEK_END);
-            size_t fsz = ftell(f);
-            size_t np = (fsz + PIECE_SZ - 1) / PIECE_SZ;
-
-            if(idx < 0 || idx >= (int)np) {
-                send_msg(c, "ERR");
-                fclose(f);
-                close(c);
-                return;
-            }
-
-            size_t off = (size_t)idx * PIECE_SZ;
-            size_t to_read = (idx == (int)np - 1) ? fsz - off : PIECE_SZ;
-
-            fseek(f, off, SEEK_SET);
-            vector<uint8_t> data(to_read);
-            size_t r = fread(data.data(), 1, to_read, f);
-            fclose(f);
-
-            if(r != to_read) {
-                send_msg(c, "ERR");
-            } else {
-                send_msg(c, "OK");
-                uint32_t n = htonl((uint32_t)to_read);
-                send_all(c, &n, 4);
-                send_all(c, data.data(), to_read);
-            }
-            close(c);
-        }).detach();
-    }
-}
-
-void start_peer_server() {
-    srand(time(NULL) + getpid());
-    int port = 20000 + rand() % 15000;
-
-    for(int tries = 0; tries < 40; tries++, port++) {
-        int test_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if(test_fd < 0) continue;
-
-        int opt = 1;
-        setsockopt(test_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-        sockaddr_in sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sin_family = AF_INET;
-        sa.sin_port = htons(port);
-        sa.sin_addr.s_addr = INADDR_ANY;
-
-        if(bind(test_fd, (sockaddr*)&sa, sizeof(sa)) == 0) {
-            close(test_fd);
-            thread(peer_server_thread, port).detach();
-            peer_port = port;
-            return;
-        }
-        close(test_fd);
-    }
-    peer_port = port;
-}
-
-bool download_piece(const string& peer, const string& fname, int idx, const string& dest, const string& hash) {
-    size_t p = peer.find(':');
-    if(p == string::npos) return false;
-
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if(fd < 0) return false;
-
-    struct timeval timeout;
-    timeout.tv_sec = 15;
-    timeout.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-    sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(stoi(peer.substr(p+1)));
-    sa.sin_addr.s_addr = inet_addr(peer.substr(0,p).c_str());
-
-    if(connect(fd, (sockaddr*)&sa, sizeof(sa)) < 0) {
-        close(fd);
+// Sends a request and reports the outcome. Returns false if the command failed
+// for any reason (unreachable trackers or a tracker-side error).
+bool call(const std::string &message, std::string &reply) {
+    if (!g_session.request(message, reply)) {
+        std::printf("error: no tracker is reachable\n");
         return false;
     }
-
-    string req = "GETPIECE " + fname + " " + to_string(idx);
-    if(!send_msg(fd, req)) {
-        close(fd);
+    if (!reply_ok(reply)) {
+        print_error(reply);
         return false;
     }
-
-    string rep;
-    if(!recv_msg(fd, rep) || rep != "OK") {
-        close(fd);
-        return false;
-    }
-
-    uint32_t n;
-    if(recv_all(fd, &n, 4) != 4) {
-        close(fd);
-        return false;
-    }
-    n = ntohl(n);
-    if(n > PIECE_SZ) {
-        close(fd);
-        return false;
-    }
-
-    vector<char> buf(n);
-    if(recv_all(fd, buf.data(), n) != (ssize_t)n) {
-        close(fd);
-        return false;
-    }
-
-    char computed[41];
-    sha1_hex((const uint8_t*)buf.data(), n, computed);
-    if(string(computed) != hash) {
-        close(fd);
-        return false;
-    }
-
-    int out_fd = open(dest.c_str(), O_WRONLY);
-    if(out_fd < 0) {
-        close(fd);
-        return false;
-    }
-
-    off_t off = (off_t)idx * (off_t)PIECE_SZ;
-    if(lseek(out_fd, off, SEEK_SET) < 0) {
-        close(out_fd);
-        close(fd);
-        return false;
-    }
-
-    ssize_t w = write(out_fd, buf.data(), n);
-    close(out_fd);
-    close(fd);
-
-    return w == (ssize_t)n;
-}
-
-void download_file(string g, string fname, string dest, vector<string> hashes, vector<string> peers, uint64_t fsz, string fsha) {
-    auto ds = make_shared<DownloadStatus>();
-    ds->group = g; ds->filename = fname; ds->dest = dest; ds->npieces = hashes.size();
-    ds->have.assign(hashes.size(), 0); ds->remaining = hashes.size();
-    ds->completed = false; ds->running = true;
-
-    {
-        lock_guard<mutex> g_dl(downloads_mtx);
-        downloads[g + ":" + fname] = ds;
-    }
-
-    int batch = min(MAX_CONCURRENT, (int)hashes.size());
-    for(int start = 0; start < (int)hashes.size(); start += batch) {
-        int end = min(start + batch, (int)hashes.size());
-        vector<thread> threads;
-
-        for(int idx = start; idx < end; idx++) {
-            threads.push_back(thread([idx, fname, dest, ds, &hashes, &peers]() {
-                string hash = hashes[idx];
-                bool success = false;
-
-                for(const auto& peer : peers) {
-                    for(int retry = 0; retry < 2; retry++) {
-                        if(download_piece(peer, fname, idx, dest, hash)) {
-                            {
-                                lock_guard<mutex> lg(ds->m);
-                                ds->have[idx] = 1;
-                            }
-                            ds->remaining--;
-                            success = true;
-                            break;
-                        }
-                    }
-                    if(success) break;
-                }
-            }));
-        }
-
-        for(auto& t : threads) {
-            if(t.joinable()) t.join();
-        }
-    }
-
-    ds->running = false;
-    if(ds->remaining == 0) {
-        ds->completed = true;
-        cout << "[C] " << g << " " << fname << endl;
-
-        vector<string> temp_pieces;
-        string temp_hash;
-        uint64_t temp_size;
-        compute_hashes(dest, temp_pieces, temp_hash, temp_size);
-
-        if(temp_hash == fsha && temp_size == fsz) {
-            string peer_addr = "127.0.0.1:" + to_string(peer_port);
-            string rep;
-            failover_send("ADD_PEER " + g + " " + fname + " " + peer_addr, rep);
-
-            lock_guard<mutex> g_uf(uploaded_mtx);
-            uploaded_files[fname] = dest;
-        }
-    }
-}
-
-void show_downloads() {
-    lock_guard<mutex> g(downloads_mtx);
-    if(downloads.empty()) {
-        cout << "No active downloads" << endl;
-        return;
-    }
-
-    for(auto& kv : downloads) {
-        auto ds = kv.second;
-        if(!ds) continue;
-
-        lock_guard<mutex> g_ds(ds->m);
-        int have = 0;
-        for(int v : ds->have) if(v) have++;
-
-        if(ds->completed) {
-            printf("[C] %s %s\n", ds->group.c_str(), ds->filename.c_str());
-        } else if(ds->running) {
-            printf("[D] %s %s - %d/%d\n", ds->group.c_str(), ds->filename.c_str(), have, ds->npieces);
-        } else if(have > 0) {
-            printf("[P] %s %s - %d/%d\n", ds->group.c_str(), ds->filename.c_str(), have, ds->npieces);
-        }
-    }
-}
-
-vector<string> parse_hashes(const string& line) {
-    vector<string> hashes;
-    size_t pos = 0;
-
-    while(pos < line.length()) {
-        while(pos < line.length() && !isxdigit(line[pos])) pos++;
-        if(pos + 40 <= line.length()) {
-            string candidate = line.substr(pos, 40);
-            bool valid = true;
-            for(char c : candidate) {
-                if(!isxdigit(c)) { valid = false; break; }
-            }
-            if(valid) {
-                hashes.push_back(candidate);
-                pos += 40;
-                if(pos < line.length() && line[pos] == ',') pos++;
-            } else {
-                pos++;
-            }
-        } else {
-            break;
-        }
-    }
-    return hashes;
-}
-
-bool parse_download_cmd(const string& line, string& group, string& filename, string& dest) {
-    string cleaned = line;
-    size_t amp = cleaned.find_last_of('&');
-    if(amp != string::npos) cleaned = cleaned.substr(0, amp);
-
-    auto tokens = split_ws(cleaned);
-    if(tokens.size() != 4 || tokens[0] != "download_file") return false;
-
-    group = tokens[1]; filename = tokens[2]; dest = tokens[3];
     return true;
 }
 
+bool require_login() {
+    if (g_session.user().empty()) {
+        std::printf("error: login required\n");
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+void cmd_create_user(const std::vector<std::string> &a) {
+    std::string reply;
+    if (call("REGISTER " + a[1] + " " + a[2], reply)) std::printf("user '%s' created\n", a[1].c_str());
+}
+
+void cmd_login(const std::vector<std::string> &a) {
+    if (!g_session.user().empty()) {
+        std::printf("error: already logged in as '%s'\n", g_session.user().c_str());
+        return;
+    }
+    std::string reply;
+    if (!g_session.request("LOGIN " + a[1] + " " + a[2] + " " + g_session.peer_token(), reply)) {
+        std::printf("error: no tracker is reachable\n");
+        return;
+    }
+    if (!reply_ok(reply)) {
+        print_error(reply);
+        return;
+    }
+    g_session.set_identity(a[1], a[2]);
+
+    // The tracker echoes the endpoint it will advertise for us, which is the
+    // address other peers will dial.
+    std::vector<std::string> parts = proto::split_ws(reply);
+    std::printf("logged in as '%s', seeding from %s\n", a[1].c_str(),
+                parts.size() > 1 ? parts[1].c_str() : "this host");
+}
+
+void cmd_logout() {
+    if (!require_login()) return;
+    std::string reply;
+    // Logging out stops sharing: the tracker drops this endpoint from every file
+    // it was seeding so no one is handed a dead peer.
+    g_session.request("LOGOUT " + g_session.user() + " " + g_session.peer_token(), reply);
+    g_session.clear_identity();
+    g_shares.clear();
+    std::printf("logged out\n");
+}
+
+void cmd_create_group(const std::vector<std::string> &a) {
+    if (!require_login()) return;
+    std::string reply;
+    if (call("CREATE_GROUP " + g_session.user() + " " + a[1], reply))
+        std::printf("group '%s' created\n", a[1].c_str());
+}
+
+void cmd_join_group(const std::vector<std::string> &a) {
+    if (!require_login()) return;
+    std::string reply;
+    if (call("JOIN_GROUP " + g_session.user() + " " + a[1], reply))
+        std::printf("join request sent to the owner of '%s'\n", a[1].c_str());
+}
+
+void cmd_leave_group(const std::vector<std::string> &a) {
+    if (!require_login()) return;
+    std::string reply;
+    if (call("LEAVE_GROUP " + g_session.user() + " " + a[1], reply)) {
+        // Anything shared into that group is no longer ours to serve.
+        for (const auto &entry : g_shares.list())
+            if (entry.first == a[1]) g_shares.remove(entry.first, entry.second);
+        std::printf("left group '%s'\n", a[1].c_str());
+    }
+}
+
+void cmd_list_groups() {
+    if (!require_login()) return;
+    std::string reply;
+    if (!call("LIST_GROUPS " + g_session.user(), reply)) return;
+    std::vector<std::string> lines = split_lines(reply);
+    if (lines.size() <= 1) {
+        std::printf("no groups exist yet\n");
+        return;
+    }
+    std::printf("%-24s %-16s %s\n", "GROUP", "OWNER", "MEMBERS");
+    for (size_t i = 1; i < lines.size(); i++) {
+        std::vector<std::string> f = proto::split_ws(lines[i]);
+        if (f.size() == 3) std::printf("%-24s %-16s %s\n", f[0].c_str(), f[1].c_str(), f[2].c_str());
+    }
+}
+
+void cmd_list_requests(const std::vector<std::string> &a) {
+    if (!require_login()) return;
+    std::string reply;
+    if (!call("LIST_REQUESTS " + g_session.user() + " " + a[1], reply)) return;
+    std::vector<std::string> lines = split_lines(reply);
+    if (lines.size() <= 1) {
+        std::printf("no pending requests for '%s'\n", a[1].c_str());
+        return;
+    }
+    for (size_t i = 1; i < lines.size(); i++) std::printf("%s\n", lines[i].c_str());
+}
+
+void cmd_accept_request(const std::vector<std::string> &a) {
+    if (!require_login()) return;
+    std::string reply;
+    if (call("ACCEPT_REQUEST " + g_session.user() + " " + a[1] + " " + a[2], reply))
+        std::printf("'%s' added to group '%s'\n", a[2].c_str(), a[1].c_str());
+}
+
+void cmd_upload_file(const std::vector<std::string> &a) {
+    if (!require_login()) return;
+    const std::string &group = a[1];
+    const std::string &path = a[2];
+
+    FileInfo info;
+    std::string error;
+    if (!client::scan_file(path, info, error)) {
+        std::printf("error: %s\n", error.c_str());
+        return;
+    }
+
+    // Basename: the group sees the file by name, not by the uploader's path.
+    size_t slash = path.find_last_of('/');
+    std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (name.empty()) {
+        std::printf("error: '%s' has no file name\n", path.c_str());
+        return;
+    }
+
+    std::string message = "UPLOAD_FILE " + g_session.user() + " " + g_session.peer_token() + " " +
+                          group + " " + name + " " + std::to_string(info.size) + " " +
+                          std::to_string(info.piece_sha.size()) + " " + info.file_sha;
+    for (const auto &h : info.piece_sha) message += " " + h;
+
+    // Register locally first so a peer that hears about the file from the
+    // tracker can never arrive before we are ready to serve it.
+    g_shares.add(group, name, path, info.size);
+
+    std::string reply;
+    if (!call(message, reply)) {
+        g_shares.remove(group, name);
+        return;
+    }
+    std::printf("sharing '%s' in '%s' (%llu bytes, %zu piece(s))\n", name.c_str(), group.c_str(),
+                static_cast<unsigned long long>(info.size), info.piece_sha.size());
+}
+
+void cmd_list_files(const std::vector<std::string> &a) {
+    if (!require_login()) return;
+    std::string reply;
+    if (!call("LIST_FILES " + g_session.user() + " " + a[1], reply)) return;
+    std::vector<std::string> lines = split_lines(reply);
+    if (lines.size() <= 1) {
+        std::printf("no files shared in '%s'\n", a[1].c_str());
+        return;
+    }
+    std::printf("%-32s %14s %s\n", "FILE", "SIZE", "SEEDERS");
+    for (size_t i = 1; i < lines.size(); i++) {
+        std::vector<std::string> f = proto::split_ws(lines[i]);
+        if (f.size() == 3)
+            std::printf("%-32s %14s %s\n", f[0].c_str(), f[1].c_str(), f[2].c_str());
+    }
+}
+
+void cmd_download_file(DownloadManager &downloads, const std::vector<std::string> &a) {
+    if (!require_login()) return;
+    const std::string &group = a[1];
+    const std::string &name = a[2];
+    const std::string &dest = a[3];
+
+    std::string reply;
+    if (!call("GET_FILE " + g_session.user() + " " + group + " " + name, reply)) return;
+
+    // OK / "<size> <npieces> <file_sha>" / piece hashes / PEERS / peer endpoints
+    std::vector<std::string> lines = split_lines(reply);
+    if (lines.size() < 2) {
+        std::printf("error: malformed tracker reply\n");
+        return;
+    }
+
+    std::vector<std::string> header = proto::split_ws(lines[1]);
+    if (header.size() != 3) {
+        std::printf("error: malformed tracker reply\n");
+        return;
+    }
+
+    DownloadManager::Request req;
+    req.group = group;
+    req.name = name;
+    req.size = std::strtoull(header[0].c_str(), nullptr, 10);
+    size_t npieces = static_cast<size_t>(std::strtoull(header[1].c_str(), nullptr, 10));
+    req.file_sha = header[2];
+
+    size_t i = 2;
+    for (; i < lines.size() && req.piece_sha.size() < npieces; i++) req.piece_sha.push_back(lines[i]);
+    if (i >= lines.size() || lines[i] != "PEERS") {
+        std::printf("error: malformed tracker reply\n");
+        return;
+    }
+    for (i++; i < lines.size(); i++)
+        if (!lines[i].empty()) req.peers.push_back(lines[i]);
+
+    // A directory destination means "put the file in here under its own name".
+    struct stat st;
+    req.dest_path = dest;
+    if (::stat(dest.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        std::string dir = dest;
+        while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+        req.dest_path = dir + "/" + name;
+    }
+
+    std::string error;
+    if (!downloads.start(req, error)) {
+        std::printf("error: %s\n", error.c_str());
+        return;
+    }
+    std::printf("downloading '%s' from %zu peer(s) into %s\n", name.c_str(), req.peers.size(),
+                req.dest_path.c_str());
+}
+
+void cmd_stop_share(const std::vector<std::string> &a) {
+    if (!require_login()) return;
+    std::string reply;
+    if (call("STOP_SHARE " + g_session.user() + " " + g_session.peer_token() + " " + a[1] + " " +
+                 a[2],
+             reply)) {
+        g_shares.remove(a[1], a[2]);
+        std::printf("stopped sharing '%s' in '%s'\n", a[2].c_str(), a[1].c_str());
+    }
+}
+
+void print_help() {
+    std::printf(
+        "user     create_user <user> <password> | login <user> <password> | logout\n"
+        "group    create_group <group> | join_group <group> | leave_group <group>\n"
+        "         list_groups | list_requests <group> | accept_request <group> <user>\n"
+        "file     upload_file <group> <file_path> | list_files <group>\n"
+        "         download_file <group> <file_name> <destination_path>\n"
+        "         show_downloads | stop_share <group> <file_name>\n"
+        "session  help | quit\n");
+}
+
+// True when the command has exactly the expected number of arguments.
+bool arity(const std::vector<std::string> &a, size_t expected, const char *usage) {
+    if (a.size() == expected) return true;
+    std::printf("usage: %s\n", usage);
+    return false;
+}
+
+}  // namespace
+
 int main(int argc, char **argv) {
-    if(argc < 3) {
-        cerr << "Usage: client <tracker_ip:port> tracker_info.txt\n";
+    if (argc != 3) {
+        std::fprintf(stderr, "Usage: %s <IP>:<PORT> <tracker_info.txt>\n", argv[0]);
         return 1;
     }
 
-    connected_tracker = argv[1];
+    proto::ignore_sigpipe();
 
-    ifstream ifs(argv[2]);
-    string l;
-    while(getline(ifs, l) && !l.empty()) trackers.push_back(l);
-
-    start_peer_server();
-    printf("Peer server listening on port %d\n", peer_port);
-
-    string line;
-    while(true) {
-        cout << "> ";
-        if(!getline(cin, line)) break;
-
-        auto tokens = split_ws(line);
-        if(tokens.empty()) continue;
-
-        string cmd = tokens[0], rep;
-
-        if(cmd == "create_user" && tokens.size() == 3) {
-            if(failover_send("REGISTER " + tokens[1] + " " + tokens[2], rep)) {
-                cout << rep << endl;
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
+    std::vector<std::string> trackers;
+    {
+        FILE *f = std::fopen(argv[2], "r");
+        if (!f) {
+            std::fprintf(stderr, "cannot open %s\n", argv[2]);
+            return 1;
         }
-        else if(cmd == "login" && tokens.size() == 3) {
-            if(failover_send("LOGIN " + tokens[1] + " " + tokens[2], rep)) {
-                if(rep == "OK") {
-                    current_user = tokens[1];
-                }
-                cout << rep << endl;
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
+        char buf[256];
+        while (std::fgets(buf, sizeof(buf), f)) {
+            std::string line(buf);
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+            if (!line.empty()) trackers.push_back(line);
         }
-        else if(cmd == "create_group" && tokens.size() == 2) {
-            if(current_user.empty()) { cout << "login required" << endl; continue; }
-            if(failover_send("CREATE_GROUP " + current_user + " " + tokens[1], rep)) {
-                cout << rep << endl;
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
-        }
-        else if(cmd == "join_group" && tokens.size() == 2) {
-            if(current_user.empty()) { cout << "login required" << endl; continue; }
-            if(failover_send("JOIN_GROUP " + current_user + " " + tokens[1], rep)) {
-                cout << rep << endl;
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
-        }
-        else if(cmd == "leave_group" && tokens.size() == 2) {
-            if(current_user.empty()) { cout << "login required" << endl; continue; }
-            if(failover_send("LEAVE_GROUP " + current_user + " " + tokens[1], rep)) {
-                cout << rep << endl;
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
-        }
-        else if(cmd == "list_groups") {
-            if(failover_send("LIST_GROUPS", rep)) {
-                cout << rep << endl;
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
-        }
-        else if(cmd == "list_requests" && tokens.size() == 2) {
-            if(current_user.empty()) { cout << "login required" << endl; continue; }
-            if(failover_send("LIST_REQUESTS " + tokens[1] + " " + current_user, rep)) {
-                cout << rep << endl;
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
-        }
-        else if(cmd == "accept_request" && tokens.size() == 3) {
-            if(current_user.empty()) { cout << "login required" << endl; continue; }
-            if(failover_send("ACCEPT_REQUEST " + tokens[1] + " " + tokens[2] + " " + current_user, rep)) {
-                cout << rep << endl;
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
-        }
-        else if(cmd == "upload_file" && tokens.size() == 3) {
-            if(current_user.empty()) { cout << "login required" << endl; continue; }
+        std::fclose(f);
+    }
+    if (trackers.empty()) {
+        std::fprintf(stderr, "%s lists no trackers\n", argv[2]);
+        return 1;
+    }
 
-            string g = tokens[1], path = tokens[2];
-            vector<string> piece_hash;
-            string file_hash;
-            uint64_t fsz;
+    std::string self = argv[1];
+    std::string host;
+    uint16_t port = 0;
+    if (!proto::parse_endpoint(self, host, port)) {
+        std::fprintf(stderr, "'%s' is not a valid <IP>:<PORT>\n", argv[1]);
+        return 1;
+    }
 
-            compute_hashes(path, piece_hash, file_hash, fsz);
-            if(piece_hash.empty()) { cout << "file read error" << endl; continue; }
+    // If the address given is a tracker's, it names the tracker to prefer rather
+    // than an address to listen on, and the kernel picks our peer port.
+    std::string preferred_tracker = trackers.front();
+    bool self_is_tracker = false;
+    for (const auto &t : trackers) self_is_tracker = self_is_tracker || t == self;
+    if (self_is_tracker) {
+        preferred_tracker = self;
+        host = "0.0.0.0";
+        port = 0;
+    }
 
-            string fname = path.substr(path.find_last_of("/\\") + 1);
-            string peer = "127.0.0.1:" + to_string(peer_port);
+    int listen_fd = proto::listen_on(host, port, 64);
+    if (listen_fd < 0) {
+        std::fprintf(stderr, "cannot listen on %s\n", self.c_str());
+        return 1;
+    }
+    uint16_t bound_port = proto::local_port(listen_fd);
 
-            {
-                lock_guard<mutex> g_uf(uploaded_mtx);
-                uploaded_files[fname] = path;
-            }
+    g_session.configure(trackers, preferred_tracker);
+    // When the client was told its own address, advertise it verbatim; otherwise
+    // send only the port and let the tracker fill in the address it sees us on.
+    g_session.set_peer_token(self_is_tracker ? std::to_string(bound_port)
+                                             : proto::make_endpoint(host, bound_port));
 
-            string msg = "UPLOAD_META " + g + " " + fname + " " + to_string(fsz) + " " + to_string(piece_hash.size()) + " " + file_hash + " " + peer + " " + current_user;
-            for(auto& ph : piece_hash) msg += " " + ph;
+    std::thread(client::run_peer_server, listen_fd, &g_shares).detach();
 
-            if(failover_send(msg, rep)) {
-                cout << rep << endl;
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
-        }
-        else if(cmd == "list_files" && tokens.size() == 2) {
-            if(current_user.empty()) { cout << "login required" << endl; continue; }
-            if(failover_send("LIST_FILES " + tokens[1] + " " + current_user, rep)) {
-                cout << rep << endl;
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
-        }
-        else if(cmd == "download_file") {
-            if(current_user.empty()) { cout << "login required" << endl; continue; }
+    DownloadManager downloads([](const std::string &group, const std::string &name,
+                                 const std::string &path, uint64_t size) {
+        // A verified download turns this client into another seeder for the file.
+        g_shares.add(group, name, path, size);
+        std::string user = g_session.user();
+        if (user.empty()) return;  // logged out while the transfer was running
+        std::string reply;
+        g_session.request(
+            "ADD_PEER " + user + " " + g_session.peer_token() + " " + group + " " + name, reply);
+    });
 
-            string g, fname, dest;
-            if(!parse_download_cmd(line, g, fname, dest)) {
-                cout << "Usage: download_file <group> <filename> <destination>" << endl;
-                continue;
-            }
+    std::printf("peer server listening on port %u; tracker %s\n", bound_port,
+                preferred_tracker.c_str());
+    std::printf("type 'help' for the command list\n");
 
-            if(!failover_send("GET_FILE_PEERS " + g + " " + fname + " " + current_user, rep)) {
-                cout << "All trackers unreachable" << endl;
-                continue;
-            }
+    std::string line;
+    for (;;) {
+        std::printf("> ");
+        std::fflush(stdout);
+        if (!std::getline(std::cin, line)) break;
 
-            if(rep.rfind("ERR", 0) == 0) { cout << rep << endl; continue; }
+        std::vector<std::string> a = proto::split_ws(line);
+        // A trailing '&' used to mean "download in the background"; downloads are
+        // always asynchronous now, so it is accepted and ignored.
+        if (!a.empty() && a.back() == "&") a.pop_back();
+        if (a.empty()) continue;
 
-            istringstream iss(rep);
-            uint64_t fsz;
-            int np;
-            iss >> fsz >> np;
-
-            string tmp;
-            getline(iss, tmp);
-            string file_sha;
-            getline(iss, file_sha);
-            string piece_line;
-            getline(iss, piece_line);
-
-            vector<string> hashes = parse_hashes(piece_line);
-            if((int)hashes.size() != np) {
-                cout << "Error: hash count mismatch" << endl;
-                continue;
-            }
-
-            string pline;
-            while(getline(iss, pline) && pline != "PEERS");
-
-            vector<string> peers;
-            while(getline(iss, pline) && !pline.empty()) {
-                peers.push_back(pline);
-            }
-
-            if(peers.empty()) { cout << "No peers available" << endl; continue; }
-
-            struct stat st;
-            string outpath = dest;
-            if(stat(dest.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-                outpath = dest + "/" + fname;
-            }
-
-            int out_fd = open(outpath.c_str(), O_CREAT | O_RDWR, 0644);
-            if(out_fd < 0) { cout << "cannot create " << dest << endl; continue; }
-
-            if(ftruncate(out_fd, fsz) != 0) {
-                cout << "cannot set file size" << endl;
-                close(out_fd);
-                continue;
-            }
-            close(out_fd);
-
-            bool background = line.find('&') != string::npos;
-
-            if(background) {
-                thread(download_file, g, fname, outpath, hashes, peers, fsz, file_sha).detach();
-            } else {
-                download_file(g, fname, outpath, hashes, peers, fsz, file_sha);
-            }
-        }
-        else if(cmd == "show_downloads") {
-            show_downloads();
-        }
-        else if(cmd == "stop_share" && tokens.size() == 3) {
-            if(current_user.empty()) { cout << "login required" << endl; continue; }
-
-            string peer = "127.0.0.1:" + to_string(peer_port);
-            if(failover_send("STOP_SHARE " + tokens[1] + " " + tokens[2] + " " + peer, rep)) {
-                cout << rep << endl;
-                lock_guard<mutex> g_uf(uploaded_mtx);
-                uploaded_files.erase(tokens[2]);
-            } else {
-                cout << "All trackers unreachable" << endl;
-            }
-        }
-        else if(cmd == "logout") {
-            current_user.clear();
-            lock_guard<mutex> g_uf(uploaded_mtx);
-            uploaded_files.clear();
-            cout << "OK" << endl;
-        }
-        else if(cmd == "quit") {
+        const std::string &cmd = a[0];
+        if (cmd == "create_user") {
+            if (arity(a, 3, "create_user <user_id> <password>")) cmd_create_user(a);
+        } else if (cmd == "login") {
+            if (arity(a, 3, "login <user_id> <password>")) cmd_login(a);
+        } else if (cmd == "logout") {
+            cmd_logout();
+        } else if (cmd == "create_group") {
+            if (arity(a, 2, "create_group <group_id>")) cmd_create_group(a);
+        } else if (cmd == "join_group") {
+            if (arity(a, 2, "join_group <group_id>")) cmd_join_group(a);
+        } else if (cmd == "leave_group") {
+            if (arity(a, 2, "leave_group <group_id>")) cmd_leave_group(a);
+        } else if (cmd == "list_groups") {
+            if (arity(a, 1, "list_groups")) cmd_list_groups();
+        } else if (cmd == "list_requests") {
+            if (arity(a, 2, "list_requests <group_id>")) cmd_list_requests(a);
+        } else if (cmd == "accept_request") {
+            if (arity(a, 3, "accept_request <group_id> <user_id>")) cmd_accept_request(a);
+        } else if (cmd == "upload_file") {
+            if (arity(a, 3, "upload_file <group_id> <file_path>")) cmd_upload_file(a);
+        } else if (cmd == "list_files") {
+            if (arity(a, 2, "list_files <group_id>")) cmd_list_files(a);
+        } else if (cmd == "download_file") {
+            if (arity(a, 4, "download_file <group_id> <file_name> <destination_path>"))
+                cmd_download_file(downloads, a);
+        } else if (cmd == "show_downloads") {
+            downloads.show_status();
+        } else if (cmd == "stop_share") {
+            if (arity(a, 3, "stop_share <group_id> <file_name>")) cmd_stop_share(a);
+        } else if (cmd == "help") {
+            print_help();
+        } else if (cmd == "quit" || cmd == "exit") {
             break;
-        }
-        else {
-            cout << "Unknown command" << endl;
+        } else {
+            std::printf("unknown command '%s' (try 'help')\n", cmd.c_str());
         }
     }
 
+    if (downloads.has_active()) std::printf("note: abandoning downloads still in progress\n");
+    if (!g_session.user().empty()) {
+        std::string reply;
+        g_session.request("LOGOUT " + g_session.user() + " " + g_session.peer_token(), reply);
+    }
     return 0;
 }
